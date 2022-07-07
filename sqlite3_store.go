@@ -16,6 +16,8 @@ var (
 	ErrKeyNotFound = errors.New("not found")
 )
 
+const mask uint64 = 9223372036854775807
+
 type AccessMode int
 
 const (
@@ -105,13 +107,13 @@ func New(path string, opts ...OptFunc) (*Sqlite3Store, error) {
 
 const logsTableSQL = `
 CREATE TABLE IF NOT EXISTS logs (
-  idx BLOB PRIMARY KEY,
-  term BLOB,
+  idx INTEGER PRIMARY KEY,
+  term INTEGER,
   type INTEGER,
   data BLOB,
   extensions BLOB,
   appendedAt INTEGER
-) WITHOUT ROWID;
+);
 `
 
 const confTableSQL = `
@@ -158,7 +160,7 @@ func (b *Sqlite3Store) Close() error {
 
 // FirstIndex returns the first known index from the Raft log.
 func (b *Sqlite3Store) FirstIndex() (uint64, error) {
-	var idx []byte
+	var idx sql.NullInt64
 	err := b.db.QueryRow(`SELECT min(idx) FROM logs`).Scan(&idx)
 	switch {
 	case err == sql.ErrNoRows:
@@ -166,16 +168,16 @@ func (b *Sqlite3Store) FirstIndex() (uint64, error) {
 	case err != nil:
 		return 0, err
 	default:
-		if len(idx) == 0 {
-			return 0, nil
+		if idx.Valid {
+			return uint64(idx.Int64), nil
 		}
-		return bytesToUint64(idx), nil
+		return 0, nil
 	}
 }
 
 // LastIndex returns the last known index from the Raft log.
 func (b *Sqlite3Store) LastIndex() (uint64, error) {
-	var idx []byte
+	var idx sql.NullInt64
 	err := b.db.QueryRow(`SELECT max(idx) FROM logs`).Scan(&idx)
 	switch {
 	case err == sql.ErrNoRows:
@@ -183,10 +185,10 @@ func (b *Sqlite3Store) LastIndex() (uint64, error) {
 	case err != nil:
 		return 0, err
 	default:
-		if len(idx) == 0 {
-			return 0, nil
+		if idx.Valid {
+			return uint64(idx.Int64), nil
 		}
-		return bytesToUint64(idx), nil
+		return 0, nil
 	}
 }
 
@@ -194,11 +196,9 @@ func (b *Sqlite3Store) LastIndex() (uint64, error) {
 func (b *Sqlite3Store) GetLog(idx uint64, log *raft.Log) error {
 	now := time.Now()
 	var (
-		bidx, bterm []byte
-		ts          int64
+		term uint64
+		ts   int64
 	)
-
-	bidx = uint64ToBytes(idx)
 
 	defer func() {
 		metrics.MeasureSince([]string{"raft", "sqlite3", "getLog"}, now)
@@ -206,8 +206,8 @@ func (b *Sqlite3Store) GetLog(idx uint64, log *raft.Log) error {
 
 	err := b.db.QueryRow(`SELECT
 idx, term, type, data, extensions, appendedAt
-FROM logs WHERE idx = ?`, bidx).Scan(
-		&bidx, &bterm, &(log.Type), &(log.Data),
+FROM logs WHERE idx = ?`, idx&mask).Scan(
+		&idx, &term, &(log.Type), &(log.Data),
 		&(log.Extensions), &ts,
 	)
 	switch {
@@ -217,7 +217,7 @@ FROM logs WHERE idx = ?`, bidx).Scan(
 		return err
 	default:
 		log.Index = idx
-		log.Term = bytesToUint64(bterm)
+		log.Term = term
 		log.AppendedAt = nanosToTime(ts)
 		return nil
 	}
@@ -250,8 +250,8 @@ INSERT INTO logs (
 	defer stmt.Close()
 
 	for _, log := range logs {
-		idx := uint64ToBytes(log.Index)
-		term := uint64ToBytes(log.Term)
+		idx := log.Index & mask
+		term := log.Term & mask
 		ts := timeToNanos(log.AppendedAt)
 
 		_, err := stmt.Exec(idx, term, log.Type, log.Data, log.Extensions, ts)
@@ -283,8 +283,8 @@ INSERT INTO logs (
 
 // DeleteRange is used to delete logs within a given range inclusively.
 func (b *Sqlite3Store) DeleteRange(min, max uint64) error {
-	minKey := uint64ToBytes(min)
-	maxKey := uint64ToBytes(max)
+	minKey := min & mask
+	maxKey := max & mask
 
 	_, err := b.db.Exec(`DELETE FROM logs WHERE idx >= ? AND idx <= ?`,
 		minKey, maxKey)
