@@ -111,14 +111,14 @@ CREATE TABLE IF NOT EXISTS logs (
   data BLOB,
   extensions BLOB,
   appendedAt INTEGER
-);
+) WITHOUT ROWID;
 `
 
 const confTableSQL = `
 CREATE TABLE IF NOT EXISTS conf (
   name BLOB PRIMARY KEY,
   value BLOB
-);
+) WITHOUT ROWID;
 `
 
 // initialize is used to set up all of the buckets.
