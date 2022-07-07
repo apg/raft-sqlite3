@@ -3,6 +3,7 @@ package raftsqlite3
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	metrics "github.com/armon/go-metrics"
@@ -10,16 +11,35 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const (
-	// Permissions to use on the db file. This is only used if the
-	// database file does not exist and needs to be created.
-	dbFileMode = 0600
-)
-
 var (
 	// An error indicating a given key does not exist
 	ErrKeyNotFound = errors.New("not found")
 )
+
+type AccessMode int
+
+const (
+	AccessDefault = iota
+	AccessRO
+	AccessRW
+	AccessRWC
+	AccessMemory
+)
+
+func (a AccessMode) String() string {
+	switch a {
+	case AccessRO:
+		return "ro"
+	case AccessRW:
+		return "rw"
+	case AccessRWC:
+		return "rwc"
+	case AccessMemory:
+		return "memory"
+	default:
+		return ""
+	}
+}
 
 // Sqlite3Store provides access to Sqlite3 for Raft to store and retrieve
 // log entries. It also provides key/value storage, and can be used as
@@ -30,47 +50,55 @@ type Sqlite3Store struct {
 
 	// The path to the Bolt database file
 	path string
+
+	mode AccessMode
+
+	pragmas []Pragmaer
 }
 
-// Options contains all the configuration used to open the Sqlite3
-type Options struct {
-	// Path is the file path to of the Sqlite3 database to use.
-	Path string
+type OptFunc func(*Sqlite3Store)
 
-	// More options!
+func WithMode(m AccessMode) OptFunc {
+	return func(s *Sqlite3Store) {
+		s.mode = m
+	}
 }
 
-// readOnly returns true if the contained sqlite3 options say to open
-// the DB in readOnly mode [this can be useful to tools that want
-// to examine the log]
-func (o *Options) readOnly() bool {
-	return o != nil // && o.BoltOptions != nil && o.BoltOptions.ReadOnly
-}
-
-// NewSqlite3Store takes a file path and returns a connected Raft backend.
-func NewSqlite3Store(path string) (*Sqlite3Store, error) {
-	return New(Options{Path: path})
+func WithPragmas(pragmas ...Pragmaer) OptFunc {
+	return func(s *Sqlite3Store) {
+		s.pragmas = pragmas
+	}
 }
 
 // New uses the supplied options to open the Sqlite3 and prepare it for use as a raft backend.
-func New(options Options) (*Sqlite3Store, error) {
-	// Try to connect
+func New(path string, opts ...OptFunc) (*Sqlite3Store, error) {
+	store := &Sqlite3Store{path: path}
+	for _, o := range opts {
+		o(store)
+	}
 
-	db, err := sql.Open("sqlite3", options.Path)
+	dsn := ""
+	if path != "" {
+		dsn = "file:" + path
+
+		if store.mode != AccessDefault {
+			dsn += "?mode=" + store.mode.String()
+		}
+	}
+
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create the new store
-	store := &Sqlite3Store{
-		db:   db,
-		path: options.Path,
-	}
+	store.db = db
 
 	// Set up our buckets
-	if err := store.initialize(); err != nil {
-		store.Close()
-		return nil, err
+	if store.mode != AccessRO {
+		if err := store.initialize(); err != nil {
+			store.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }
@@ -100,6 +128,14 @@ func (b *Sqlite3Store) initialize() error {
 		return err
 	}
 	defer tx.Rollback()
+
+	// go through all the pragmas from the options.
+	for _, p := range b.pragmas {
+		_, err := b.db.Exec(fmt.Sprintf("PRAGMA %s = %s", p.Pragma(), p.String()))
+		if err != nil {
+			return err
+		}
+	}
 
 	// Create the Logs table
 	_, err = tx.Exec(logsTableSQL)

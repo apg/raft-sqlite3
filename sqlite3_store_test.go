@@ -2,10 +2,13 @@ package raftsqlite3
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 )
@@ -18,7 +21,7 @@ func testSqlite3Store(t testing.TB) *Sqlite3Store {
 	os.Remove(fh.Name())
 
 	// Successfully creates and returns a store
-	store, err := NewSqlite3Store(fh.Name())
+	store, err := New(fh.Name())
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -51,7 +54,14 @@ func TestNewSqlite3Store(t *testing.T) {
 	defer os.Remove(fh.Name())
 
 	// Successfully creates and returns a store
-	store, err := NewSqlite3Store(fh.Name())
+	store, err := New(fh.Name(),
+		WithPragmas(
+			BusyTimeout(time.Millisecond*5000),
+			JournalDelete,
+			SynchronousNormal,
+		),
+	)
+
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -64,26 +74,85 @@ func TestNewSqlite3Store(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	// Close the store so we can open again
-	if err := store.Close(); err != nil {
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+	}()
+
+	// Check to see if PRAGMAs were set
+	var value string
+	for _, p := range store.pragmas {
+		err := store.db.QueryRow(fmt.Sprintf("PRAGMA %s", p.Pragma())).
+			Scan(&value)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if p.String() != value {
+			t.Fatalf("bad %s: %s", p.Pragma(), value)
+		}
+	}
+
+	// Check to see if tables were created
+	expected := map[string]bool{
+		"conf": true, "logs": true,
+	}
+
+	rows, err := store.db.Query(`SELECT name FROM sqlite_master
+WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+`)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		err = rows.Scan(&name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, ok := expected[name]; !ok {
+			t.Fatalf("bad: %s", name)
+		} else {
+			delete(expected, name)
+		}
+	}
+	err = rows.Err()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// assert we found all tables
+	if len(expected) != 0 {
+		t.Fatalf("still have: %v", expected)
+	}
+}
+
+func TestNewSqlite3Store_RO(t *testing.T) {
+	fh, err := ioutil.TempFile("", "sqlite3")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	os.Remove(fh.Name())
+	defer os.Remove(fh.Name())
+
+	store, err := New(fh.Name())
+	store.Close()
+
+	// Successfully creates and returns a store
+	store, err = New(fh.Name(), WithMode(AccessRO))
+	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	// Ensure our tables were created
-	// db, err := bolt.Open(fh.Name(), dbFileMode, nil)
-	// if err != nil {
-	// 	t.Fatalf("err: %s", err)
-	// }
-	// tx, err := db.Begin(true)
-	// if err != nil {
-	// 	t.Fatalf("err: %s", err)
-	// }
-	// if _, err := tx.CreateBucket([]byte(dbLogs)); err != bolt.ErrBucketExists {
-	// 	t.Fatalf("bad: %v", err)
-	// }
-	// if _, err := tx.CreateBucket([]byte(dbConf)); err != bolt.ErrBucketExists {
-	// 	t.Fatalf("bad: %v", err)
-	// }
+	// Try to write. It should fail.
+	k, v := []byte("hello"), []byte("world")
+
+	// Try to set a k/v pair
+	if err := store.Set(k, v); err == nil {
+		t.Fatalf("err: %s", err)
+	}
 }
 
 func TestSqlite3Store_FirstIndex(t *testing.T) {

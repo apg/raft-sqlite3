@@ -1,4 +1,4 @@
-module github.com/hashicorp/raft-boltdb
+module github.com/apg/raft-sqlite3
 
 go 1.16
 
